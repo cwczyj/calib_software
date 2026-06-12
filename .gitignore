@@ -1,0 +1,50 @@
+# --- Node.js ---
+node_modules/
+npm-debug.log*
+
+# --- Build output ---
+dist/
+
+# --- Tauri / Rust ---
+src-tauri/target/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+
+# --- Agent / IDE ---
+.agents/
+.codex/
+.superpowers/
+.sisyphus/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Backups ---
+_backup_old/
+.git_backup_*/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Env / Secrets ---
+.env
+.env.local
+.env.*.local
+
+# --- Logs ---
+*.log
+
+# --- Large binary assets ---
+*.pdf
+*.png
