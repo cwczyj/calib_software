@@ -168,6 +168,12 @@ type ConversionPreviewRequestPayload = {
   primaryMatrixRows: string[];
   secondaryTransformName: string;
   secondaryMatrixRows: string[];
+  cameraIntrinsics?: CameraIntrinsics;
+  squaresX?: number;
+  squaresY?: number;
+  squareLength?: number;
+  markerLength?: number;
+  arucoDict?: string;
 };
 
 type ConversionPreviewResult = {
@@ -319,60 +325,6 @@ function aggregateFrameRms(values: Array<number | null | undefined>) {
   const finite = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   if (finite.length === 0) return null;
   return Math.sqrt(finite.reduce((sum, value) => sum + value * value, 0) / finite.length);
-}
-
-function shellQuote(value: string) {
-  return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
-}
-
-function pathJoin(directory: string, filename: string) {
-  const separator = directory.includes("\\") ? "\\" : "/";
-  return `${directory.replace(/[\\/]+$/, "")}${separator}${filename}`;
-}
-
-function scipyEulerOrder(poseFormat: string) {
-  if (poseFormat.length === 4 && (poseFormat[0] === "s" || poseFormat[0] === "r")) {
-    const axes = poseFormat.slice(1);
-    return poseFormat[0] === "s" ? axes.toLowerCase() : axes.toUpperCase();
-  }
-  return poseFormat;
-}
-
-export function buildCalibrationCliCommand(request: CalibrationRequestPayload) {
-  const cameraParams = request.cameraParams || pathJoin(request.imageDir, "camera_params.yaml");
-  const outputPath = pathJoin(request.imageDir, "calibration_result.yaml");
-  const args = [
-    "python",
-    "st_handeye_calibration/calibrate.py",
-    shellQuote(request.imageDir),
-    shellQuote(request.posesFile),
-    "-c",
-    shellQuote(cameraParams),
-    "--setup",
-    request.setup,
-    "--pose_rot_order",
-    scipyEulerOrder(request.poseFormat),
-    "--pose_rot_unit",
-    "deg",
-    "--pose_direction",
-    "as-is",
-    "--use_depth",
-    request.useDepth,
-    "--squares_x",
-    String(request.squaresX),
-    "--squares_y",
-    String(request.squaresY),
-    "--square_length",
-    String(request.squareLength),
-    "--marker_length",
-    String(request.markerLength),
-    "--aruco_dict",
-    request.arucoDict,
-    ...(request.filterInconsistent === true ? ["--filter_inconsistent"] : []),
-    "--output",
-    shellQuote(outputPath),
-  ];
-  return args.join(" ");
 }
 
 function parseCameraIntrinsics(
@@ -571,7 +523,6 @@ export function App() {
               };
               setLastCalibrationRequest(request);
               setIsCalculating(true);
-              addLog(`CLI复现命令：${buildCalibrationCliCommand(request)}`);
               addLog("标定计算中...");
               try {
                 const result = await invoke<CalibrationRun>("run_handeye_calibration", {
@@ -1288,6 +1239,16 @@ function ToolsPage({
       setToolMessage("请先完成一次手眼标定，确保主/辅变换矩阵可用");
       return;
     }
+    const intrinsics = parseCameraIntrinsics(cameraIntrinsics, distortionCoefficients);
+    if (!intrinsics) {
+      setToolMessage("请先填写有效的相机内参（在标定页选择包含 camera_params.yaml 的数据文件夹）");
+      return;
+    }
+    const boardParams = parseCharucoBoardParams(charucoParams);
+    if (!boardParams) {
+      setToolMessage("请填写有效的 ChArUco 标定板参数");
+      return;
+    }
     setIsGeneratingPreview(true);
     setToolMessage("输出预览生成中...");
     try {
@@ -1314,6 +1275,8 @@ function ToolsPage({
           primaryMatrixRows,
           secondaryTransformName: calibrationResult.secondaryTransformName || (calibrationResult.setup === "eye-to-hand" ? "T_O2F" : "T_O2W"),
           secondaryMatrixRows,
+          cameraIntrinsics: intrinsics,
+          ...boardParams,
         } satisfies ConversionPreviewRequestPayload,
       });
       setConversionPreview(result.previewFrames ?? []);

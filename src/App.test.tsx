@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { App, buildCalibrationCliCommand } from "./App";
+import { App } from "./App";
 import { axisColors, matrixRowsToThreeSetArgs, originColor } from "./CoordinatePreview3D";
 
 const { mockOpen, mockSave } = vi.hoisted(() => ({
@@ -33,28 +33,6 @@ describe("HandEyeManager UI", () => {
     mockOpen.mockReset();
     mockSave.mockReset();
     mockInvoke.mockReset();
-  });
-
-  it("builds a calibrate.py command from the calibration request", () => {
-    const command = buildCalibrationCliCommand({
-      imageDir: "/tmp/handeye data",
-      posesFile: "/tmp/handeye data/poses.csv",
-      marker: "charuco",
-      cameraIntrinsics: { cx: 640, cy: 360, fx: 600, fy: 600 },
-      cameraParams: null,
-      setup: "eye-in-hand",
-      poseFormat: "rxyz",
-      useDepth: "off",
-      squaresX: 14,
-      squaresY: 9,
-      squareLength: 0.02,
-      markerLength: 0.015,
-      arucoDict: "DICT_5X5_50",
-    });
-
-    expect(command).toBe(
-      'python st_handeye_calibration/calibrate.py "/tmp/handeye data" "/tmp/handeye data/poses.csv" -c "/tmp/handeye data/camera_params.yaml" --setup eye-in-hand --pose_rot_order XYZ --pose_rot_unit deg --pose_direction as-is --use_depth off --squares_x 14 --squares_y 9 --square_length 0.02 --marker_length 0.015 --aruco_dict DICT_5X5_50 --output "/tmp/handeye data/calibration_result.yaml"',
-    );
   });
 
   it("keeps row-major transform translations in the three.js matrix set arguments", () => {
