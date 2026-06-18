@@ -186,6 +186,8 @@ struct FrameError {
     translation_error_mm: Option<f64>,
     #[serde(default)]
     rotation_error_deg: Option<f64>,
+    #[serde(default)]
+    used_chessboard_fallback: bool,
 }
 
 fn default_true() -> bool {
@@ -223,6 +225,8 @@ struct DetectionObservation {
     image_path: String,
     corner_ids: Vec<usize>,
     image_points: Vec<Vector2<f64>>,
+    marker_count: usize,
+    used_chessboard_fallback: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +235,15 @@ struct SyntheticDetection {
     image_path: String,
     corner_ids: Vec<usize>,
     image_points: Vec<Vector2<f64>>,
+    marker_count: usize,
+    used_chessboard_fallback: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DepthObservation {
+    corner_ids: Vec<usize>,
+    object_points: Vec<Vector3<f64>>,
+    camera_points: Vec<Vector3<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +292,7 @@ struct HandeyeProjectionFactor {
     pose: Matrix4<f64>,
     object_points: Vec<Vector3<f64>>,
     image_points: Vec<Vector2<f64>>,
+    depth_observation: Option<DepthObservation>,
     intrinsics: CameraIntrinsics,
 }
 
@@ -313,6 +327,11 @@ impl Factor for HandeyeProjectionFactor {
 
     fn get_dimension(&self) -> usize {
         self.image_points.len() * 2
+            + self
+                .depth_observation
+                .as_ref()
+                .map(|depth| depth.camera_points.len() * 3)
+                .unwrap_or(0)
     }
 }
 
@@ -326,7 +345,7 @@ impl HandeyeProjectionFactor {
             &primary_matrix,
             &secondary_matrix,
         );
-        let residuals = self
+        let mut residuals = self
             .object_points
             .iter()
             .zip(self.image_points.iter())
@@ -335,6 +354,17 @@ impl HandeyeProjectionFactor {
                 [projected.x - observed.x, projected.y - observed.y]
             })
             .collect::<Vec<_>>();
+        if let Some(depth) = &self.depth_observation {
+            for (point_object, observed) in depth.object_points.iter().zip(depth.camera_points.iter()) {
+                let predicted = object_to_camera.fixed_view::<3, 3>(0, 0) * point_object
+                    + object_to_camera.fixed_view::<3, 1>(0, 3);
+                residuals.extend_from_slice(&[
+                    predicted.x - observed.x,
+                    predicted.y - observed.y,
+                    predicted.z - observed.z,
+                ]);
+            }
+        }
         DVector::from_vec(residuals)
     }
 }
@@ -497,12 +527,13 @@ fn optimize_handeye_from_measurements(
     observations: &[DetectionObservation],
     poses: &[Matrix4<f64>],
     measured_object_to_camera: &[Matrix4<f64>],
+    depth_observations: &[Option<DepthObservation>],
 ) -> Result<HandeyeOptimization, String> {
     let (primary_init, secondary_init) =
         initialize_global_transforms(setup, &measured_object_to_camera, poses)?;
 
     let mut problem = Problem::new(JacobianMode::Dense);
-    for (pose, observation) in poses.iter().zip(observations.iter()) {
+    for (row, (pose, observation)) in poses.iter().zip(observations.iter()).enumerate() {
         let object_points = observation
             .corner_ids
             .iter()
@@ -515,6 +546,7 @@ fn optimize_handeye_from_measurements(
                 pose: *pose,
                 object_points,
                 image_points: observation.image_points.clone(),
+                depth_observation: depth_observations.get(row).cloned().flatten(),
                 intrinsics: intrinsics.clone(),
             }),
             None,
@@ -614,6 +646,8 @@ impl ObservationLike for SyntheticDetection {
             image_path: self.image_path.clone(),
             corner_ids: self.corner_ids.clone(),
             image_points: self.image_points.clone(),
+            marker_count: self.marker_count,
+            used_chessboard_fallback: self.used_chessboard_fallback,
         }
     }
 }
@@ -651,10 +685,11 @@ fn initialize_global_transforms(
         )?,
     )];
     if setup == "eye-in-hand" {
-        let primary = calibrate_handeye_primary(poses, measured_object_to_camera)?;
-        let secondary =
-            estimate_secondary_from_primary(setup, poses, measured_object_to_camera, &primary)?;
-        seeds.push((primary, secondary));
+        if let Ok(primary) = calibrate_handeye_primary(poses, measured_object_to_camera) {
+            let secondary =
+                estimate_secondary_from_primary(setup, poses, measured_object_to_camera, &primary)?;
+            seeds.push((primary, secondary));
+        }
     } else if let Ok(primary) = calibrate_handeye_primary(poses, measured_object_to_camera) {
         let secondary =
             estimate_secondary_from_primary(setup, poses, measured_object_to_camera, &primary)?;
@@ -787,6 +822,205 @@ fn compute_pose_errors(
     }
 }
 
+fn should_flip_chessboard_by_markers(
+    marker_centers: &[Vector2<f64>],
+    marker_ids: &[i32],
+) -> bool {
+    if marker_centers.len() < 2 || marker_centers.len() != marker_ids.len() {
+        return false;
+    }
+    let mut order = (0..marker_centers.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        marker_centers[*left]
+            .y
+            .partial_cmp(&marker_centers[*right].y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top = order.into_iter().take(8).collect::<Vec<_>>();
+    if top.len() < 2 {
+        return false;
+    }
+    let mut top_by_x = top;
+    top_by_x.sort_by(|left, right| {
+        marker_centers[*left]
+            .x
+            .partial_cmp(&marker_centers[*right].x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let ids = top_by_x
+        .iter()
+        .map(|index| marker_ids[*index] as f64)
+        .collect::<Vec<_>>();
+    ids.windows(2).map(|pair| pair[1] - pair[0]).sum::<f64>() < 0.0
+}
+
+fn apply_homography_2d(h: &Matrix3<f64>, point: &Vector2<f64>) -> Option<Vector2<f64>> {
+    let mapped = h * nalgebra::Vector3::new(point.x, point.y, 1.0);
+    if mapped.z.abs() < 1e-9 {
+        None
+    } else {
+        Some(Vector2::new(mapped.x / mapped.z, mapped.y / mapped.z))
+    }
+}
+
+fn reorder_chessboard_corners_via_homography(
+    detected: &[Vector2<f64>],
+    board_points: &[Vector3<f64>],
+    square_length: f64,
+    image_to_board: &Matrix3<f64>,
+) -> Option<Vec<Vector2<f64>>> {
+    if detected.len() != board_points.len() || square_length <= 0.0 {
+        return None;
+    }
+    let cols_x = board_points
+        .iter()
+        .map(|point| (point.x / square_length).round() as i32 - 1)
+        .max()
+        .map(|value| value + 1)? as usize;
+    let rows_y = board_points
+        .iter()
+        .map(|point| (point.y / square_length).round() as i32 - 1)
+        .max()
+        .map(|value| value + 1)? as usize;
+    if cols_x * rows_y != board_points.len() {
+        return None;
+    }
+
+    let mut reordered = vec![Vector2::zeros(); detected.len()];
+    let mut assigned = vec![false; detected.len()];
+    for point in detected {
+        let mapped = apply_homography_2d(image_to_board, point)?;
+        let col = (mapped.x / square_length).round() as i32 - 1;
+        let row = (mapped.y / square_length).round() as i32 - 1;
+        if !(0..cols_x as i32).contains(&col) || !(0..rows_y as i32).contains(&row) {
+            return None;
+        }
+        let index = row as usize * cols_x + col as usize;
+        if assigned[index] {
+            return None;
+        }
+        let expected = board_points[index];
+        if (mapped.x - expected.x).abs() > square_length * 0.6
+            || (mapped.y - expected.y).abs() > square_length * 0.6
+        {
+            return None;
+        }
+        reordered[index] = *point;
+        assigned[index] = true;
+    }
+    assigned.into_iter().all(|value| value).then_some(reordered)
+}
+
+fn board_marker_reference_centers(
+    board: &objdetect::CharucoBoard,
+) -> Result<HashMap<i32, Vector2<f64>>, String> {
+    let ids = board
+        .get_ids()
+        .map_err(|err| format!("读取 board marker ids 失败: {err}"))?;
+    let obj_points = board
+        .get_obj_points()
+        .map_err(|err| format!("读取 board marker 点失败: {err}"))?;
+    let mut centers = HashMap::new();
+    for (marker_id, corners) in ids.iter().zip(obj_points.iter()) {
+        if corners.is_empty() {
+            continue;
+        }
+        let mean = corners.iter().fold(Vector2::zeros(), |acc, point| {
+            acc + Vector2::new(point.x as f64, point.y as f64)
+        }) / corners.len() as f64;
+        centers.insert(marker_id, mean);
+    }
+    Ok(centers)
+}
+
+fn marker_homography_to_board(
+    board: &objdetect::CharucoBoard,
+    marker_centers: &[Vector2<f64>],
+    marker_ids: &[i32],
+) -> Result<Option<Matrix3<f64>>, String> {
+    if marker_centers.len() < 4 || marker_centers.len() != marker_ids.len() {
+        return Ok(None);
+    }
+    let reference = board_marker_reference_centers(board)?;
+    let mut image_points = Vec::<Point2f>::new();
+    let mut board_points = Vec::<Point2f>::new();
+    for (center, marker_id) in marker_centers.iter().zip(marker_ids.iter()) {
+        if let Some(board_center) = reference.get(marker_id) {
+            image_points.push(Point2f::new(center.x as f32, center.y as f32));
+            board_points.push(Point2f::new(board_center.x as f32, board_center.y as f32));
+        }
+    }
+    if image_points.len() < 4 {
+        return Ok(None);
+    }
+    let mut mask = Mat::default();
+    let homography = calib3d::find_homography_def(
+        &Vector::<Point2f>::from_iter(image_points),
+        &Vector::<Point2f>::from_iter(board_points),
+        &mut mask,
+    )
+    .map_err(|err| format!("估计 marker 单应矩阵失败: {err}"))?;
+    if homography.empty() {
+        return Ok(None);
+    }
+    Ok(Some(mat_to_matrix3(&homography)?))
+}
+
+fn reorder_chessboard_corners_for_board(
+    mut corners: Vec<Vector2<f64>>,
+    squares_x: usize,
+    squares_y: usize,
+    marker_info: Option<(&[Vector2<f64>], &[i32])>,
+) -> Vec<Vector2<f64>> {
+    if let Some((marker_centers, marker_ids)) = marker_info {
+        if should_flip_chessboard_by_markers(marker_centers, marker_ids) {
+            corners.reverse();
+        }
+    }
+
+    let cols_x = squares_x.saturating_sub(1);
+    let rows_y = squares_y.saturating_sub(1);
+    if cols_x == 0 || rows_y == 0 || corners.len() != cols_x * rows_y {
+        return corners;
+    }
+
+    let cols_per_scan = cols_x;
+    let mut reordered = vec![Vector2::zeros(); corners.len()];
+    for (det_idx, point) in corners.into_iter().enumerate() {
+        let scan = det_idx / cols_per_scan;
+        let pos = det_idx % cols_per_scan;
+        let pattern_idx = pos * cols_x + scan;
+        if pattern_idx < reordered.len() {
+            reordered[pattern_idx] = point;
+        }
+    }
+    reordered
+}
+
+const MIN_DETECTION_CORNERS: usize = 8;
+const MIN_CHARUCO_MARKERS: usize = 4;
+const MAX_PNP_REPROJECTION_PX: f64 = 1.5;
+const MIN_FALLBACK_COVERAGE: f64 = 0.7;
+
+fn detection_passes_quality_gate(
+    detection: &DetectionObservation,
+    total_board_corners: usize,
+    reprojection_mean_px: f64,
+) -> bool {
+    if detection.corner_ids.len() < MIN_DETECTION_CORNERS {
+        return false;
+    }
+    if !reprojection_mean_px.is_finite() || reprojection_mean_px > MAX_PNP_REPROJECTION_PX {
+        return false;
+    }
+    if detection.used_chessboard_fallback {
+        return total_board_corners > 0
+            && detection.corner_ids.len() as f64 / total_board_corners as f64
+                >= MIN_FALLBACK_COVERAGE;
+    }
+    detection.marker_count >= MIN_CHARUCO_MARKERS
+}
+
 fn filter_inconsistent_measurements(
     setup: &str,
     poses: &[Matrix4<f64>],
@@ -888,6 +1122,7 @@ fn compute_reference_consistency(
     poses: &[Matrix4<f64>],
     primary: &Matrix4<f64>,
     measured_object_to_camera: &[Matrix4<f64>],
+    depth_observations: &[Option<DepthObservation>],
 ) -> Option<DistanceStats> {
     let mut points_by_corner: HashMap<usize, Vec<(usize, Vector3<f64>)>> = HashMap::new();
     let mut per_image_points = Vec::with_capacity(observations.len());
@@ -898,19 +1133,31 @@ fn compute_reference_consistency(
         } else {
             poses[row].try_inverse()? * primary
         };
-        let measured = measured_object_to_camera[row];
         let mut image_points = Vec::new();
-        for corner_id in &observation.corner_ids {
-            let point_object = board_points[*corner_id];
-            let point_camera = measured.fixed_view::<3, 3>(0, 0) * point_object
-                + measured.fixed_view::<3, 1>(0, 3);
-            let point_reference = reference.fixed_view::<3, 3>(0, 0) * point_camera
-                + reference.fixed_view::<3, 1>(0, 3);
-            points_by_corner
-                .entry(*corner_id)
-                .or_default()
-                .push((row, point_reference));
-            image_points.push((*corner_id, point_reference));
+        if let Some(Some(depth)) = depth_observations.get(row) {
+            for (corner_id, point_camera) in depth.corner_ids.iter().zip(depth.camera_points.iter()) {
+                let point_reference = reference.fixed_view::<3, 3>(0, 0) * point_camera
+                    + reference.fixed_view::<3, 1>(0, 3);
+                points_by_corner
+                    .entry(*corner_id)
+                    .or_default()
+                    .push((row, point_reference));
+                image_points.push((*corner_id, point_reference));
+            }
+        } else {
+            let measured = measured_object_to_camera[row];
+            for corner_id in &observation.corner_ids {
+                let point_object = board_points[*corner_id];
+                let point_camera = measured.fixed_view::<3, 3>(0, 0) * point_object
+                    + measured.fixed_view::<3, 1>(0, 3);
+                let point_reference = reference.fixed_view::<3, 3>(0, 0) * point_camera
+                    + reference.fixed_view::<3, 1>(0, 3);
+                points_by_corner
+                    .entry(*corner_id)
+                    .or_default()
+                    .push((row, point_reference));
+                image_points.push((*corner_id, point_reference));
+            }
         }
         per_image_points.push(image_points);
     }
@@ -1067,12 +1314,14 @@ fn solve_from_depth(
     board_points: &[Vector3<f64>],
     observation: &DetectionObservation,
     depth_path: &str,
-) -> Result<(Matrix4<f64>, Vec<[f64; 3]>), String> {
+) -> Result<(Matrix4<f64>, DepthObservation), String> {
     let (pixels, width, height) = load_depth_pixels(&PathBuf::from(depth_path))?;
 
     let n = observation.corner_ids.len();
     let mut board_pts = Vec::with_capacity(n);
     let mut cam_pts = Vec::with_capacity(n);
+    let mut depth_corner_ids = Vec::with_capacity(n);
+    let mut depth_object_points = Vec::with_capacity(n);
     let mut corner_cam_points = Vec::with_capacity(n);
 
     for (&corner_id, point) in observation
@@ -1086,14 +1335,12 @@ fn solve_from_depth(
         let py = v.round() as i32;
 
         if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
-            corner_cam_points.push([0.0, 0.0, 0.0]);
             continue;
         }
 
         let idx = (py as u32 * width + px as u32) as usize;
         let depth_mm = pixels[idx] as f64;
         if depth_mm < 1.0 {
-            corner_cam_points.push([0.0, 0.0, 0.0]);
             continue;
         }
         let depth_m = depth_mm / 1000.0;
@@ -1106,7 +1353,9 @@ fn solve_from_depth(
         let board_pt = board_points[corner_id];
         board_pts.push(Vector3::new(board_pt.x, board_pt.y, board_pt.z));
         cam_pts.push(Vector3::new(x, y, z));
-        corner_cam_points.push([x, y, z]);
+        depth_corner_ids.push(corner_id);
+        depth_object_points.push(Vector3::new(board_pt.x, board_pt.y, board_pt.z));
+        corner_cam_points.push(Vector3::new(x, y, z));
     }
 
     if board_pts.len() < 4 {
@@ -1152,7 +1401,14 @@ fn solve_from_depth(
     transform[(1, 3)] = t.y;
     transform[(2, 3)] = t.z;
 
-    Ok((transform, corner_cam_points))
+    Ok((
+        transform,
+        DepthObservation {
+            corner_ids: depth_corner_ids,
+            object_points: depth_object_points,
+            camera_points: corner_cam_points,
+        },
+    ))
 }
 
 fn parse_depth_mode(use_depth: &str) -> Result<DepthMode, String> {
@@ -1226,8 +1482,9 @@ fn resolve_object_to_camera_measurements(
     intrinsics: &CameraIntrinsics,
     board_points: &[Vector3<f64>],
     observations: &[DetectionObservation],
-) -> Result<(Vec<Matrix4<f64>>, bool), String> {
+) -> Result<(Vec<Matrix4<f64>>, Vec<Option<DepthObservation>>, bool), String> {
     let mut measurements = Vec::with_capacity(observations.len());
+    let mut depth_observations = Vec::with_capacity(observations.len());
     let mut depth_used = false;
 
     for observation in observations {
@@ -1240,8 +1497,9 @@ fn resolve_object_to_camera_measurements(
                     observation,
                     &depth_path.to_string_lossy(),
                 ) {
-                    Ok((transform, _)) => {
+                    Ok((transform, depth_observation)) => {
                         measurements.push(transform);
+                        depth_observations.push(Some(depth_observation));
                         depth_used = true;
                         continue;
                     }
@@ -1262,9 +1520,10 @@ fn resolve_object_to_camera_measurements(
             board_points,
             observation,
         )?);
+        depth_observations.push(None);
     }
 
-    Ok((measurements, depth_used))
+    Ok((measurements, depth_observations, depth_used))
 }
 
 fn calibrate_handeye_primary(
@@ -1453,6 +1712,34 @@ fn board_points_from_charuco(board: &objdetect::CharucoBoard) -> Result<Vec<Vect
         .collect())
 }
 
+fn preprocess_detection_gray(undistorted: &Mat) -> Result<Mat, String> {
+    let mut gray = Mat::default();
+    imgproc::cvt_color(
+        undistorted,
+        &mut gray,
+        imgproc::COLOR_BGR2GRAY,
+        0,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )
+    .map_err(|err| format!("灰度转换失败: {err}"))?;
+    Ok(gray)
+}
+
+fn configured_charuco_detector_params() -> Result<objdetect::DetectorParameters, String> {
+    let mut detector_params = objdetect::DetectorParameters::default()
+        .map_err(|err| format!("创建 ArUco 检测参数失败: {err}"))?;
+    detector_params.set_corner_refinement_method(1);
+    detector_params.set_corner_refinement_win_size(5);
+    detector_params.set_corner_refinement_max_iterations(30);
+    detector_params.set_corner_refinement_min_accuracy(0.001);
+    detector_params.set_adaptive_thresh_win_size_min(3);
+    detector_params.set_adaptive_thresh_win_size_max(23);
+    detector_params.set_adaptive_thresh_win_size_step(10);
+    detector_params.set_min_marker_perimeter_rate(0.02);
+    detector_params.set_max_marker_perimeter_rate(4.0);
+    Ok(detector_params)
+}
+
 fn detect_charuco_observation(
     image_path: &str,
     board: &objdetect::CharucoBoard,
@@ -1460,6 +1747,24 @@ fn detect_charuco_observation(
     squares_x: usize,
     squares_y: usize,
 ) -> Result<Option<DetectionObservation>, String> {
+    fn refine_corners_subpix(gray: &Mat, corners: &mut Mat, label: &str) -> Result<(), String> {
+        let criteria = core::TermCriteria::new(
+            core::TermCriteria_Type::COUNT as i32 + core::TermCriteria_Type::EPS as i32,
+            30,
+            0.001,
+        )
+        .map_err(|err| format!("创建{label}亚像素终止条件失败: {err}"))?;
+        imgproc::corner_sub_pix(
+            gray,
+            corners,
+            core::Size::new(5, 5),
+            core::Size::new(-1, -1),
+            criteria,
+        )
+        .map_err(|err| format!("{label}亚像素优化失败: {err}"))?;
+        Ok(())
+    }
+
     let image = imgcodecs::imread(image_path, imgcodecs::IMREAD_COLOR)
         .map_err(|err| format!("读取图像失败: {err}"))?;
     if image.empty() {
@@ -1476,15 +1781,7 @@ fn detect_charuco_observation(
         &camera_matrix,
     )
     .map_err(|err| format!("图像去畸变失败: {err}"))?;
-    let mut gray = Mat::default();
-    imgproc::cvt_color(
-        &undistorted,
-        &mut gray,
-        imgproc::COLOR_BGR2GRAY,
-        0,
-        core::AlgorithmHint::ALGO_HINT_DEFAULT,
-    )
-    .map_err(|err| format!("灰度转换失败: {err}"))?;
+    let gray = preprocess_detection_gray(&undistorted)?;
     let mut charuco_params = objdetect::CharucoParameters::default()
         .map_err(|err| format!("创建 Charuco 参数失败: {err}"))?;
     charuco_params.set_camera_matrix(
@@ -1493,8 +1790,7 @@ fn detect_charuco_observation(
             .map_err(|err| format!("复制相机矩阵失败: {err}"))?,
     );
     charuco_params.set_dist_coeffs(zero_distortion_mat()?);
-    let detector_params = objdetect::DetectorParameters::default()
-        .map_err(|err| format!("创建 ArUco 检测参数失败: {err}"))?;
+    let detector_params = configured_charuco_detector_params()?;
     let refine_params = objdetect::RefineParameters::new_def()
         .map_err(|err| format!("创建 ArUco refine 参数失败: {err}"))?;
     let detector =
@@ -1504,6 +1800,7 @@ fn detect_charuco_observation(
     let mut ids = Mat::default();
     let mut marker_corners = Vector::<Vector<Point2f>>::new();
     let mut marker_ids = Mat::default();
+    let mut chessboard_fallback_points: Option<Vec<Vector2<f64>>> = None;
     detector
         .detect_board(
             &gray,
@@ -1513,6 +1810,9 @@ fn detect_charuco_observation(
             &mut marker_ids,
         )
         .map_err(|err| format!("ChArUco 检测失败: {err}"))?;
+    if corners.rows() >= 4 && ids.rows() > 0 {
+        refine_corners_subpix(&gray, &mut corners, "ChArUco")?;
+    }
     if corners.rows() < 4 || ids.rows() == 0 {
         let dictionary = board
             .get_dictionary()
@@ -1541,20 +1841,7 @@ fn detect_charuco_observation(
                 )
                 .map_err(|err| format!("ChArUco marker 插值失败: {err}"))?;
             if corners.rows() >= 4 && ids.rows() > 0 {
-                let criteria = core::TermCriteria::new(
-                    core::TermCriteria_Type::COUNT as i32 + core::TermCriteria_Type::EPS as i32,
-                    30,
-                    0.001,
-                )
-                .map_err(|err| format!("创建亚像素终止条件失败: {err}"))?;
-                imgproc::corner_sub_pix(
-                    &gray,
-                    &mut corners,
-                    core::Size::new(5, 5),
-                    core::Size::new(-1, -1),
-                    criteria,
-                )
-                .map_err(|err| format!("ChArUco 亚像素优化失败: {err}"))?;
+                refine_corners_subpix(&gray, &mut corners, "ChArUco")?;
             }
         }
     }
@@ -1568,50 +1855,101 @@ fn detect_charuco_observation(
         )
         .map_err(|err| format!("棋盘格角点检测失败: {err}"))?;
         if found {
-            let criteria = core::TermCriteria::new(
-                core::TermCriteria_Type::COUNT as i32 + core::TermCriteria_Type::EPS as i32,
-                30,
-                0.001,
-            )
-            .map_err(|err| format!("创建棋盘格亚像素终止条件失败: {err}"))?;
-            imgproc::corner_sub_pix(
-                &gray,
-                &mut corners,
-                core::Size::new(5, 5),
-                core::Size::new(-1, -1),
-                criteria,
-            )
-            .map_err(|err| format!("棋盘格亚像素优化失败: {err}"))?;
-            ids = sequential_ids_mat(corners.rows())?;
+            refine_corners_subpix(&gray, &mut corners, "棋盘格")?;
+            let mut detected = Vec::with_capacity(corners.rows() as usize);
+            for row in 0..corners.rows() {
+                let point = *corners
+                    .at_2d::<core::Point2f>(row, 0)
+                    .map_err(|err| format!("读取棋盘格角点坐标失败: {err}"))?;
+                detected.push(Vector2::new(point.x as f64, point.y as f64));
+            }
+            let marker_info = if marker_ids.rows() > 0 && !marker_corners.is_empty() {
+                let centers = marker_corners
+                    .iter()
+                    .map(|corners| {
+                        let mean = corners
+                            .iter()
+                            .fold(Vector2::zeros(), |acc, point| {
+                                acc + Vector2::new(point.x as f64, point.y as f64)
+                            })
+                            / corners.len() as f64;
+                        mean
+                    })
+                    .collect::<Vec<_>>();
+                let ids = (0..marker_ids.rows())
+                    .map(|row| {
+                        marker_ids
+                            .at_2d::<i32>(row, 0)
+                            .copied()
+                            .map_err(|err| format!("读取 marker id 失败: {err}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some((centers, ids))
+            } else {
+                None
+            };
+            let homography_reordered = marker_info
+                .as_ref()
+                .and_then(|(centers, ids)| {
+                    marker_homography_to_board(board, centers, ids)
+                        .ok()
+                        .flatten()
+                        .and_then(|homography| {
+                            board_points_from_charuco(board)
+                                .ok()
+                                .and_then(|board_points| {
+                                    reorder_chessboard_corners_via_homography(
+                                        &detected,
+                                        &board_points,
+                                        board.get_square_length().ok()? as f64,
+                                        &homography,
+                                    )
+                                })
+                        })
+                });
+            chessboard_fallback_points = Some(homography_reordered.unwrap_or_else(|| {
+                reorder_chessboard_corners_for_board(
+                    detected,
+                    squares_x,
+                    squares_y,
+                    marker_info
+                        .as_ref()
+                        .map(|(centers, ids)| (centers.as_slice(), ids.as_slice())),
+                )
+            }));
         }
     }
     if corners.rows() < 4 || ids.rows() == 0 {
-        return Ok(None);
+        if chessboard_fallback_points.is_none() {
+            return Ok(None);
+        }
     }
-    let mut corner_ids = Vec::with_capacity(ids.rows() as usize);
-    let mut image_points = Vec::with_capacity(ids.rows() as usize);
-    for row in 0..ids.rows() {
-        let corner_id = *ids
-            .at_2d::<i32>(row, 0)
-            .map_err(|err| format!("读取角点 id 失败: {err}"))?;
-        let point = *corners
-            .at_2d::<core::Point2f>(row, 0)
-            .map_err(|err| format!("读取角点坐标失败: {err}"))?;
-        corner_ids.push(corner_id as usize);
-        image_points.push(Vector2::new(point.x as f64, point.y as f64));
-    }
+    let used_chessboard_fallback = chessboard_fallback_points.is_some();
+    let (corner_ids, image_points) = if let Some(points) = chessboard_fallback_points {
+        ((0..points.len()).collect::<Vec<_>>(), points)
+    } else {
+        let mut corner_ids = Vec::with_capacity(ids.rows() as usize);
+        let mut image_points = Vec::with_capacity(ids.rows() as usize);
+        for row in 0..ids.rows() {
+            let corner_id = *ids
+                .at_2d::<i32>(row, 0)
+                .map_err(|err| format!("读取角点 id 失败: {err}"))?;
+            let point = *corners
+                .at_2d::<core::Point2f>(row, 0)
+                .map_err(|err| format!("读取角点坐标失败: {err}"))?;
+            corner_ids.push(corner_id as usize);
+            image_points.push(Vector2::new(point.x as f64, point.y as f64));
+        }
+        (corner_ids, image_points)
+    };
     Ok(Some(DetectionObservation {
         index: 0,
         image_path: image_path.to_string(),
         corner_ids,
         image_points,
+        marker_count: marker_ids.rows().max(0) as usize,
+        used_chessboard_fallback,
     }))
-}
-
-fn sequential_ids_mat(count: i32) -> Result<Mat, String> {
-    let rows = (0..count).map(|value| [value]).collect::<Vec<_>>();
-    Mat::from_slice_2d(&rows.iter().map(|row| row.as_slice()).collect::<Vec<_>>())
-        .map_err(|err| format!("创建棋盘格角点 id 失败: {err}"))
 }
 
 #[tauri::command]
@@ -1634,6 +1972,8 @@ struct CharucoDetection {
     success: bool,
     num_corners: usize,
     num_markers: usize,
+    #[serde(default)]
+    used_chessboard_fallback: bool,
     message: String,
     #[serde(default)]
     corner_rows: Vec<CharucoCornerRow>,
@@ -2031,6 +2371,7 @@ fn run_handeye_calibration_direct(
                 base_consistency_count: None,
                 translation_error_mm: None,
                 rotation_error_deg: None,
+                used_chessboard_fallback: false,
             });
             continue;
         }
@@ -2049,6 +2390,8 @@ fn run_handeye_calibration_direct(
                     image_path: image_path.clone(),
                     corner_ids: detection.corner_ids.clone(),
                     image_points: detection.image_points.clone(),
+                    marker_count: detection.marker_count,
+                    used_chessboard_fallback: detection.used_chessboard_fallback,
                 });
                 frame_errors.push(FrameError {
                     index,
@@ -2069,6 +2412,7 @@ fn run_handeye_calibration_direct(
                     base_consistency_count: None,
                     translation_error_mm: None,
                     rotation_error_deg: None,
+                    used_chessboard_fallback: detection.used_chessboard_fallback,
                 });
             }
             _ => {
@@ -2091,6 +2435,7 @@ fn run_handeye_calibration_direct(
                     base_consistency_count: None,
                     translation_error_mm: None,
                     rotation_error_deg: None,
+                    used_chessboard_fallback: false,
                 });
             }
         }
@@ -2108,12 +2453,61 @@ fn run_handeye_calibration_direct(
         .iter()
         .map(ObservationLike::to_observation)
         .collect::<Vec<_>>();
-    let (mut measured_object_to_camera, depth_used) = resolve_object_to_camera_measurements(
+    let (mut measured_object_to_camera, mut depth_observations, depth_used) = resolve_object_to_camera_measurements(
         &depth_mode,
         &intrinsics,
         &board_points,
         &observations,
     )?;
+    let total_board_corners = board_points.len();
+    let quality_keep = observations
+        .iter()
+        .zip(measured_object_to_camera.iter())
+        .enumerate()
+        .filter_map(|(row, (observation, measured))| {
+            let reprojection = compute_reprojection_metrics(
+                &intrinsics,
+                &board_points,
+                std::slice::from_ref(observation),
+                std::slice::from_ref(measured),
+            );
+            detection_passes_quality_gate(observation, total_board_corners, reprojection.mean_px)
+                .then_some(row)
+        })
+        .collect::<Vec<_>>();
+    if quality_keep.len() >= 3 && quality_keep.len() < detections.len() {
+        let keep_set = quality_keep
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let rejected = (0..detections.len())
+            .filter(|local_index| !keep_set.contains(local_index))
+            .map(|local_index| active_pose_indices[local_index])
+            .collect::<Vec<_>>();
+        filtered_images.extend(rejected.iter().copied());
+        for index in rejected {
+            mark_frame_filtered(&mut frame_errors, index);
+        }
+        detections = quality_keep
+            .iter()
+            .map(|index| detections[*index].clone())
+            .collect();
+        active_poses = quality_keep.iter().map(|index| active_poses[*index]).collect();
+        observations = quality_keep
+            .iter()
+            .map(|index| observations[*index].clone())
+            .collect();
+        measured_object_to_camera = quality_keep
+            .iter()
+            .map(|index| measured_object_to_camera[*index])
+            .collect();
+        depth_observations = quality_keep
+            .iter()
+            .map(|index| depth_observations[*index].clone())
+            .collect();
+        filtered_images.sort_unstable();
+        filtered_images.dedup();
+    }
 
     if payload.filter_inconsistent.unwrap_or(true) {
         let keep = filter_inconsistent_measurements(
@@ -2147,6 +2541,10 @@ fn run_handeye_calibration_direct(
                 .iter()
                 .map(|index| measured_object_to_camera[*index])
                 .collect();
+            depth_observations = keep
+                .iter()
+                .map(|index| depth_observations[*index].clone())
+                .collect();
             filtered_images.sort_unstable();
             filtered_images.dedup();
         }
@@ -2162,6 +2560,7 @@ fn run_handeye_calibration_direct(
         &observations,
         &active_poses,
         &measured_object_to_camera,
+        &depth_observations,
     )?;
     let pose_errors = compute_pose_errors(
         &payload.setup,
@@ -2177,6 +2576,7 @@ fn run_handeye_calibration_direct(
         &active_poses,
         &solution.primary_transform,
         &solution.measured_object_to_camera,
+        &depth_observations,
     );
     let derived_reprojection = compute_reprojection_metrics(
         &intrinsics,
@@ -2753,7 +3153,7 @@ fn charuco_detect_and_draw(
         .replace("_Color", "");
     let output_path = output_dir.join(format!("detection_{stem}.png"));
 
-    let (success, num_corners, num_markers, message, corner_rows) =
+    let (success, num_corners, num_markers, used_chessboard_fallback, message, corner_rows) =
         if let Some(detection) = obs {
             let n_corners = detection.corner_ids.len();
             let mut rows = Vec::with_capacity(n_corners);
@@ -2788,10 +3188,16 @@ fn charuco_detect_and_draw(
 
             if n_corners >= 4 {
                 let t_o2c = if let Some(depth) = depth_path {
-                    solve_from_depth(intrinsics, &board_points, &detection, depth).map(|(t, cam_pts)| {
-                        for (row, cp) in rows.iter_mut().zip(cam_pts.iter()) {
-                            if cp[0] != 0.0 || cp[1] != 0.0 || cp[2] != 0.0 {
-                                row.camera_point = Some(*cp);
+                    solve_from_depth(intrinsics, &board_points, &detection, depth).map(|(t, depth_obs)| {
+                        let by_corner = depth_obs
+                            .corner_ids
+                            .iter()
+                            .zip(depth_obs.camera_points.iter())
+                            .map(|(corner_id, point)| (*corner_id, [point.x, point.y, point.z]))
+                            .collect::<HashMap<_, _>>();
+                        for row in rows.iter_mut() {
+                            if let Some(point) = by_corner.get(&row.id) {
+                                row.camera_point = Some(*point);
                             }
                         }
                         t
@@ -2834,13 +3240,20 @@ fn charuco_detect_and_draw(
                 .map_err(|err| format!("创建输出目录失败: {err}"))?;
             let _ = imgcodecs::imwrite_def(&output_path.to_string_lossy(), &overlay);
 
-            (true, n_corners, 0, "ok".to_string(), rows)
+            (
+                true,
+                n_corners,
+                detection.marker_count,
+                detection.used_chessboard_fallback,
+                "ok".to_string(),
+                rows,
+            )
         } else {
             fs::create_dir_all(output_dir)
                 .map_err(|err| format!("创建输出目录失败: {err}"))?;
             let _ = imgcodecs::imwrite_def(&output_path.to_string_lossy(), &overlay);
 
-            (false, 0, 0, "ChArUco detection failed".to_string(), vec![])
+            (false, 0, 0, false, "ChArUco detection failed".to_string(), vec![])
         };
 
     Ok(CharucoDetection {
@@ -2849,6 +3262,7 @@ fn charuco_detect_and_draw(
         success,
         num_corners,
         num_markers,
+        used_chessboard_fallback,
         message,
         corner_rows,
     })
@@ -3328,6 +3742,158 @@ mod tests {
     }
 
     #[test]
+    fn eye_in_hand_initialization_falls_back_when_tsai_seed_fails() {
+        let poses = vec![Matrix4::identity(), Matrix4::identity(), Matrix4::identity()];
+        let measured = vec![Matrix4::identity(), Matrix4::identity(), Matrix4::identity()];
+
+        let (primary, secondary) = initialize_global_transforms("eye-in-hand", &measured, &poses)
+            .expect("fallback initialization should succeed");
+
+        assert!(translation_distance(&primary, &Matrix4::identity()) < 1e-12);
+        assert!(rotation_distance_deg(&primary, &Matrix4::identity()) < 1e-12);
+        assert!(translation_distance(&secondary, &Matrix4::identity()) < 1e-12);
+        assert!(rotation_distance_deg(&secondary, &Matrix4::identity()) < 1e-12);
+    }
+
+    #[test]
+    fn chessboard_fallback_reorders_corners_and_flips_with_marker_ids() {
+        let detected = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(0.0, 1.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(1.0, 1.0),
+        ];
+        let marker_centers = vec![
+            Vector2::new(0.0, 0.0),
+            Vector2::new(1.0, 0.0),
+            Vector2::new(0.0, 1.0),
+            Vector2::new(1.0, 1.0),
+        ];
+        let marker_ids = vec![3, 2, 1, 0];
+
+        let reordered = reorder_chessboard_corners_for_board(
+            detected,
+            3,
+            3,
+            Some((&marker_centers, &marker_ids)),
+        );
+
+        assert_eq!(reordered.len(), 4);
+        assert_eq!(reordered[0], Vector2::new(1.0, 1.0));
+        assert_eq!(reordered[1], Vector2::new(0.0, 1.0));
+        assert_eq!(reordered[2], Vector2::new(1.0, 0.0));
+        assert_eq!(reordered[3], Vector2::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn homography_reorder_restores_row_major_corner_ids_after_180_rotation() {
+        let detected = vec![
+            Vector2::new(2.0, 2.0),
+            Vector2::new(1.0, 2.0),
+            Vector2::new(2.0, 1.0),
+            Vector2::new(1.0, 1.0),
+        ];
+        let board_points = vec![
+            Vector3::new(1.0, 1.0, 0.0),
+            Vector3::new(2.0, 1.0, 0.0),
+            Vector3::new(1.0, 2.0, 0.0),
+            Vector3::new(2.0, 2.0, 0.0),
+        ];
+
+        let reordered = reorder_chessboard_corners_via_homography(
+            &detected,
+            &board_points,
+            1.0,
+            &Matrix3::identity(),
+        )
+        .expect("homography reorder should produce a valid mapping");
+
+        assert_eq!(reordered[0], Vector2::new(1.0, 1.0));
+        assert_eq!(reordered[1], Vector2::new(2.0, 1.0));
+        assert_eq!(reordered[2], Vector2::new(1.0, 2.0));
+        assert_eq!(reordered[3], Vector2::new(2.0, 2.0));
+    }
+
+    #[test]
+    fn detection_quality_gate_rejects_low_quality_fallback_frames() {
+        let detection = DetectionObservation {
+            index: 0,
+            image_path: "frame.png".to_string(),
+            corner_ids: (0..12).collect(),
+            image_points: (0..12)
+                .map(|value| Vector2::new(value as f64, 0.0))
+                .collect(),
+            marker_count: 0,
+            used_chessboard_fallback: true,
+        };
+
+        assert!(!detection_passes_quality_gate(&detection, 40, 0.2));
+        assert!(detection_passes_quality_gate(&detection, 16, 0.2));
+    }
+
+    #[test]
+    fn detection_quality_gate_rejects_high_reprojection_error() {
+        let detection = DetectionObservation {
+            index: 0,
+            image_path: "frame.png".to_string(),
+            corner_ids: (0..20).collect(),
+            image_points: (0..20)
+                .map(|value| Vector2::new(value as f64, 0.0))
+                .collect(),
+            marker_count: 8,
+            used_chessboard_fallback: false,
+        };
+
+        assert!(detection_passes_quality_gate(&detection, 40, 0.8));
+        assert!(!detection_passes_quality_gate(&detection, 40, 2.0));
+    }
+
+    #[test]
+    fn reference_consistency_prefers_depth_camera_points_when_available() {
+        let board_points = vec![
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.1, 0.0, 0.0),
+        ];
+        let observation = DetectionObservation {
+            index: 0,
+            image_path: "frame.png".to_string(),
+            corner_ids: vec![0, 1],
+            image_points: vec![Vector2::new(0.0, 0.0), Vector2::new(1.0, 0.0)],
+            marker_count: 2,
+            used_chessboard_fallback: false,
+        };
+        let poses = vec![Matrix4::identity(), Matrix4::identity()];
+        let primary = Matrix4::identity();
+        let measured = vec![Matrix4::identity(), Matrix4::identity()];
+        let depth_points = vec![
+            Some(DepthObservation {
+                corner_ids: vec![0, 1],
+                object_points: board_points.clone(),
+                camera_points: vec![Vector3::new(0.0, 0.0, 1.0), Vector3::new(0.1, 0.0, 1.0)],
+            }),
+            Some(DepthObservation {
+                corner_ids: vec![0, 1],
+                object_points: board_points.clone(),
+                camera_points: vec![Vector3::new(0.02, 0.0, 1.0), Vector3::new(0.12, 0.0, 1.0)],
+            }),
+        ];
+
+        let stats = compute_reference_consistency(
+            "eye-in-hand",
+            &board_points,
+            &[observation.clone(), observation],
+            &poses,
+            &primary,
+            &measured,
+            &depth_points,
+        )
+        .expect("depth-backed consistency should be available");
+
+        assert!(stats.rms_m > 0.009);
+        assert!(stats.rms_m < 0.011);
+    }
+
+    #[test]
     fn reprojection_metrics_keep_derived_and_reference_errors_separate() {
         let intrinsics = CameraIntrinsics {
             cx: 320.0,
@@ -3347,6 +3913,8 @@ mod tests {
                 .iter()
                 .map(|point| project_point(&intrinsics, &reference_pose, point))
                 .collect(),
+            marker_count: 2,
+            used_chessboard_fallback: false,
         };
 
         let reference = compute_reprojection_metrics(
@@ -3497,9 +4065,11 @@ mod tests {
                 Vector2::new(0.0, 1.0),
                 Vector2::new(1.0, 1.0),
             ],
+            marker_count: 4,
+            used_chessboard_fallback: false,
         };
 
-        let (measurements, depth_used) = resolve_object_to_camera_measurements(
+        let (measurements, depth_observations, depth_used) = resolve_object_to_camera_measurements(
             &DepthMode::Optional,
             &intrinsics,
             &board_points,
@@ -3509,6 +4079,8 @@ mod tests {
 
         assert!(depth_used);
         assert_eq!(measurements.len(), 1);
+        assert_eq!(depth_observations.len(), 1);
+        assert!(depth_observations[0].is_some());
         assert!((measurements[0][(2, 3)] - 1.0).abs() < 1e-9);
     }
 
@@ -3590,6 +4162,8 @@ mod tests {
                     image_path: format!("frame_{index:03}.png"),
                     corner_ids: (0..board_points.len()).collect(),
                     image_points,
+                    marker_count: board_points.len(),
+                    used_chessboard_fallback: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -3612,6 +4186,7 @@ mod tests {
             &observations,
             &poses,
             &measured,
+            &vec![None; observations.len()],
         )
         .expect("synthetic optimization should succeed");
 
@@ -3626,6 +4201,53 @@ mod tests {
         assert!(translation_distance(&solution.secondary_transform, &target) < 1e-3);
         assert!(rotation_distance_deg(&solution.secondary_transform, &target) < 0.2);
         assert!(solution.reprojection_mean_px < 1e-6);
+    }
+
+    #[test]
+    fn configured_charuco_detector_params_tune_main_path_for_precision() {
+        let params =
+            configured_charuco_detector_params().expect("detector parameters should be created");
+
+        assert_eq!(params.corner_refinement_method(), 1);
+        assert_eq!(params.corner_refinement_win_size(), 5);
+        assert_eq!(params.corner_refinement_max_iterations(), 30);
+        assert!((params.corner_refinement_min_accuracy() - 0.001).abs() < f64::EPSILON);
+        assert_eq!(params.adaptive_thresh_win_size_min(), 3);
+        assert_eq!(params.adaptive_thresh_win_size_max(), 23);
+        assert_eq!(params.adaptive_thresh_win_size_step(), 10);
+        assert!((params.min_marker_perimeter_rate() - 0.02).abs() < f64::EPSILON);
+        assert!((params.max_marker_perimeter_rate() - 4.0).abs() < f64::EPSILON);
+        assert!(!params.use_aruco3_detection());
+    }
+
+    #[test]
+    fn preprocess_detection_gray_matches_plain_grayscale() {
+        let input = Mat::new_rows_cols_with_default(
+            6,
+            8,
+            core::CV_8UC3,
+            core::Scalar::new(32.0, 96.0, 160.0, 0.0),
+        )
+        .expect("test image should be created");
+
+        let gray =
+            preprocess_detection_gray(&input).expect("gray preprocessing should succeed");
+        let mut expected = Mat::default();
+        imgproc::cvt_color(
+            &input,
+            &mut expected,
+            imgproc::COLOR_BGR2GRAY,
+            0,
+            core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )
+        .expect("plain grayscale should succeed");
+
+        assert_eq!(gray.rows(), 6);
+        assert_eq!(gray.cols(), 8);
+        assert_eq!(gray.channels(), 1);
+        assert_eq!(gray.typ() & core::CV_MAT_DEPTH_MASK, core::CV_8U);
+        let diff = core::norm2_def(&gray, &expected).expect("gray diff should compute");
+        assert!(diff.abs() < f64::EPSILON);
     }
 }
 

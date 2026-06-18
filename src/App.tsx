@@ -82,6 +82,7 @@ type FrameError = {
   index: number;
   imagePath?: string;
   used: boolean;
+  usedChessboardFallback?: boolean;
   cornerCount?: number | null;
   reprojectionMeanPx?: number | null;
   reprojectionRmsPx?: number | null;
@@ -105,6 +106,7 @@ type CharucoDetection = {
   success: boolean;
   numCorners: number;
   numMarkers: number;
+  usedChessboardFallback?: boolean;
   message: string;
   cornerRows: CharucoCornerRow[];
 };
@@ -904,10 +906,9 @@ function ResultsPage({
                 <th>使用</th>
                 <th>帧</th>
                 <th>图像</th>
+                <th>检测模式</th>
                 <th>角点</th>
                 <th title="最终全局手眼链路推导位姿的角点重投影 RMS">2D RMS(px)</th>
-                <th title="最终全局手眼链路推导位姿的最大单角点重投影误差">2D max(px)</th>
-                <th title="每帧参考位姿的平均角点重投影误差">参考 mean(px)</th>
                 <th title="参考位姿与全局手眼链路推导位姿之间的平移残差">平移残差(mm)</th>
                 <th title="参考位姿与全局手眼链路推导位姿之间的最小旋转角残差">旋转残差(deg)</th>
                 <th title={consistencyTitle}>{consistencyLabel}(mm)</th>
@@ -931,10 +932,9 @@ function ResultsPage({
                     </td>
                     <td>{String(row.index).padStart(3, "0")}</td>
                     <td>{row.imagePath ? fileNameFromPath(row.imagePath) : ""}</td>
+                    <td>{detectionModeLabel(row.usedChessboardFallback)}</td>
                     <td>{row.cornerCount ?? ""}</td>
                     <td>{formatOptionalNumber(row.reprojectionRmsPx)}</td>
-                    <td>{formatOptionalNumber(row.reprojectionMaxPx)}</td>
-                    <td>{formatOptionalNumber(firstNumber(row.referenceReprojectionMeanPx, row.optimizedReprojectionErrorPx))}</td>
                     <td>{formatOptionalNumber(row.translationErrorMm)}</td>
                     <td>{formatOptionalNumber(row.rotationErrorDeg)}</td>
                     <td>{formatOptionalNumber(row.baseConsistencyRmsMm)}</td>
@@ -942,7 +942,7 @@ function ResultsPage({
                 ))
               ) : (
                 <tr>
-                  <td colSpan={10}>暂无逐帧误差数据</td>
+                  <td colSpan={9}>暂无逐帧误差数据</td>
                 </tr>
               )}
             </tbody>
@@ -1023,6 +1023,10 @@ function clearFrameErrorMetrics(row: FrameError): FrameError {
     translationErrorMm: null,
     rotationErrorDeg: null,
   };
+}
+
+function detectionModeLabel(usedChessboardFallback?: boolean) {
+  return usedChessboardFallback ? "Chessboard fallback" : "ChArUco";
 }
 
 function CharucoBoardParamPanel({
@@ -1342,6 +1346,9 @@ function ToolsPage({
               <div className="tool-detection-summary">
                 <div className="detection-summary">
                   角点 {charucoDetection.numCorners} / 标记 {charucoDetection.numMarkers}
+                </div>
+                <div className="detection-summary">
+                  {detectionModeLabel(charucoDetection.usedChessboardFallback)}
                 </div>
               </div>
             )}

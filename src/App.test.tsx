@@ -581,6 +581,7 @@ describe("HandEyeManager UI", () => {
               index: 0,
               imagePath: "001_Color.png",
               used: true,
+              usedChessboardFallback: false,
               cornerCount: 42,
               reprojectionMeanPx: 0.21,
               reprojectionRmsPx: 0.27,
@@ -596,6 +597,7 @@ describe("HandEyeManager UI", () => {
               index: 1,
               imagePath: "002_Color.png",
               used: true,
+              usedChessboardFallback: true,
               cornerCount: 38,
               reprojectionMeanPx: 0.63,
               reprojectionRmsPx: 0.71,
@@ -640,20 +642,19 @@ describe("HandEyeManager UI", () => {
     expect(screen.getByText("4 / 5")).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "角点" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "2D RMS(px)" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "2D max(px)" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "底座3D RMS(mm)" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "参考 mean(px)" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "平移残差(mm)" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "旋转残差(deg)" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "检测模式" })).toBeInTheDocument();
     expect(screen.getByText("001_Color.png")).toBeInTheDocument();
     expect(screen.getByText("002_Color.png")).toBeInTheDocument();
+    expect(screen.getByText("ChArUco")).toBeInTheDocument();
+    expect(screen.getByText("Chessboard fallback")).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
     expect(screen.getByText("38")).toBeInTheDocument();
     expect(screen.getByText("0.270000")).toBeInTheDocument();
-    expect(screen.getByText("0.800000")).toBeInTheDocument();
     expect(screen.getByText("1.300000")).toBeInTheDocument();
     expect(screen.getByText("0.710000")).toBeInTheDocument();
-    expect(screen.getByText("1.400000")).toBeInTheDocument();
     expect(screen.getByText("1.900000")).toBeInTheDocument();
     expect(screen.getByText("1.200000")).toBeInTheDocument();
     expect(screen.getByText("3.800000")).toBeInTheDocument();
@@ -992,6 +993,7 @@ describe("HandEyeManager UI", () => {
           success: true,
           numCorners: 48,
           numMarkers: 24,
+          usedChessboardFallback: true,
           message: "ok",
           cornerRows: [
             {
@@ -1061,6 +1063,7 @@ describe("HandEyeManager UI", () => {
       }),
     });
     expect(screen.getByText("角点 48 / 标记 24")).toBeInTheDocument();
+    expect(screen.getByText("Chessboard fallback")).toBeInTheDocument();
     expect(document.querySelector(".tool-input-column .detection-summary")).not.toBeInTheDocument();
     expect(document.querySelector(".tool-detection-summary .detection-summary")).toHaveTextContent("角点 48 / 标记 24");
     expect(screen.getByRole("img", { name: "ChArUco 检测结果" })).toHaveAttribute(
