@@ -37,10 +37,10 @@
 | **前端** | [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/) |
 | **3D 可视化** | [Three.js](https://threejs.org/) |
 | **构建工具** | [Vite 7](https://vitejs.dev/) |
-| **标定算法** | Python + OpenCV + SciPy + nanomanifold |
+| **标定算法** | Rust + OpenCV + apex-manifolds + apex-solver |
 | **相机模型** | OpenCV pinhole（支持畸变系数） |
 | **标记物检测** | OpenCV ChArUco + ArUco |
-| **API 层** | FastAPI + Uvicorn |
+| **后端接口** | Tauri Commands |
 
 ## 项目结构
 
@@ -59,22 +59,6 @@ calib_software/
 │   ├── Cargo.toml                # Rust 依赖（opencv, nalgebra, apex-solver 等）
 │   └── tauri.conf.json           # Tauri 配置
 │
-├── st_handeye_calibration/       # Python 标定核心库
-│   ├── st_handeye/               # 标定核心包
-│   │   ├── __init__.py
-│   │   ├── calibrator.py         # HandEyeCalibrator 主类
-│   │   ├── optimizer.py          # 因子图优化器（SciPy least_squares + nanomanifold）
-│   │   ├── board.py              # ChArUco 棋盘格检测
-│   │   ├── camera.py             # Pinhole 相机模型
-│   │   ├── depth.py              # 深度图加载与采样
-│   │   ├── evaluation.py         # 标定评估与可视化
-│   │   ├── io.py                 # 位姿 CSV / 相机参数 YAML I/O
-│   │   └── types.py              # 数据类型定义
-│   ├── calibrate.py              # CLI 入口
-│   ├── gui_api.py                # GUI API 层（检测/标定/预览）
-│   ├── api_server.py             # FastAPI HTTP 服务
-│   └── requirements.txt
-│
 ├── docs/images/                  # README 图片资源
 ├── package.json
 ├── vite.config.ts
@@ -87,7 +71,7 @@ calib_software/
 
 1. **角点检测** — 对每张图像检测 ChArUco 角点，通过 PnP 求解标定板到相位的初始变换
 2. **初始估计** — 由第一组观测推导全局手眼变换的初始值
-3. **联合优化** — 使用 SciPy `least_squares` 在 SE(3) 流形上联合优化：
+3. **联合优化** — 使用 Rust 因子图求解器在 SE(3) 流形上联合优化：
    - `T_C2F`（Eye-in-Hand）或 `T_C2W`（Eye-to-Hand）：相机到末端/基座变换
    - `T_O2W`（Eye-in-Hand）或 `T_O2F`（Eye-to-Hand）：标定板参考位姿
 4. **残差项** — 重投影误差（2D）、深度点误差（3D，可选）、位姿约束（诊断模式）
@@ -100,17 +84,7 @@ calib_software/
 
 - [Node.js](https://nodejs.org/) >= 18
 - [Rust](https://rustup.rs/) (通过 rustup 安装)
-- [Python](https://www.python.org/) >= 3.9
 - OpenCV 4.x 开发包（编译 Rust opencv 绑定需要）
-
-### 安装 Python 依赖
-
-```bash
-cd st_handeye_calibration
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
 
 ### 开发模式启动
 
@@ -132,30 +106,6 @@ npm run tauri build
 
 ```bash
 npm run dev
-```
-
-## CLI 使用
-
-Python 标定库也支持独立命令行使用：
-
-```bash
-cd st_handeye_calibration
-
-# 执行手眼标定
-python calibrate.py <图像目录> <位姿文件.csv> \
-  -c camera_params.yaml \
-  --setup eye-in-hand \
-  --visualize \
-  --filter_inconsistent
-
-# ChArUco 检测
-python gui_api.py detect-charuco <图像路径> \
-  --squares_x 14 --squares_y 9 \
-  --square_length 0.020 --marker_length 0.015
-
-# 运行标定（CLI 模式）
-python gui_api.py run-calibration <图像目录> <位姿文件> \
-  --setup eye-in-hand --output result.yaml
 ```
 
 ## 配置说明

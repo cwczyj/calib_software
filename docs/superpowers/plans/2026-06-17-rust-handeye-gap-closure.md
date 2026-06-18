@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Complete the Rust hand-eye backend so it fully supports the Python parity gaps that still matter for the product, while keeping the frontend depth path disabled by default.
+**Goal:** Complete the Rust hand-eye backend so it fully supports the remaining product gaps while keeping the frontend depth path disabled by default.
 
-**Architecture:** Extend the existing Rust Tauri backend in `src-tauri/src/lib.rs` instead of reviving Python runtime paths. Preserve the current frontend request shape, wire the dormant depth fields through the Rust calibration and ChArUco helpers, and lock the behavior down with focused Rust unit tests.
+**Architecture:** Extend the existing Rust Tauri backend in `src-tauri/src/lib.rs`. Preserve the current frontend request shape, wire the dormant depth fields through the Rust calibration and ChArUco helpers, and lock the behavior down with focused Rust unit tests.
 
 **Tech Stack:** Rust, Tauri, OpenCV, nalgebra, existing `cargo test` suite
 
@@ -39,11 +39,10 @@
 - [ ] Populate `camera_point` rows from depth samples when depth is provided and valid.
 - [ ] Keep non-depth detection behavior unchanged.
 
-### Task 4: Verify end-to-end parity evidence
+### Task 4: Verify end-to-end implementation evidence
 
 **Files:**
 - Modify: none
 
 - [ ] Run `cargo test --manifest-path src-tauri/Cargo.toml`.
-- [ ] Run `PYTHONPATH=st_handeye_calibration pytest st_handeye_calibration/tests -q`.
-- [ ] Summarize which Python code is still only historical/reference and which paths are no longer required by the shipped app runtime.
+- [ ] Summarize which legacy implementation paths were removed and which runtime paths remain in the shipped app.

@@ -1278,7 +1278,7 @@ fn solve_pnp_measurement(
         .map(|point| Point2d::new(point.x, point.y))
         .collect::<Vector<Point2d>>();
     let camera_matrix = camera_matrix_mat(intrinsics)?;
-    // Observations are detected on undistorted images, matching Python's assume_undistorted=True.
+    // Observations are detected on undistorted images, so the PnP solve uses zero distortion here.
     let distortion = zero_distortion_mat()?;
     let mut rvec = Mat::default();
     let mut tvec = Mat::default();
@@ -1504,7 +1504,7 @@ fn resolve_object_to_camera_measurements(
                         continue;
                     }
                     Err(_) => {
-                        // Match Python behavior: invalid depth samples fall back to PnP.
+                        // If depth samples are unusable, fall back to the PnP estimate.
                     }
                 },
                 Err(err) => {
